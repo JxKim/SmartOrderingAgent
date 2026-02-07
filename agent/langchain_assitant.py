@@ -13,6 +13,7 @@ root_path = Path(__file__).parent.parent
 embeddings =None
 milvus_client = None
 engine = None
+agent = None
 def get_embeddings():
     global embeddings
     if embeddings is None:
@@ -174,6 +175,37 @@ VALUES
 
         return "预订成功"
     
+async def assistant_query(user_query:str):
+    """
+    接收来自前端的用户query，使用agent进行回复
+    """
+    agent = await create_agent()
+    # 1、调用前，新添加一个system prompt，让agent感知当前的时间
+    from datetime import datetime
+    from langchain.messages import ToolMessage
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    day_of_week = datetime.now().weekday() + 1
+    time_system_prompt = {"role":"system","content":f"当前日期为：{current_date}，当前是周{day_of_week}"}
+
+    # 2、config如何去构建：在实际的生产环境下，每个用户的每一次会话，在后端系统当中，都会有一个session_id，可以拿这个session_id作为thread_id传进去
+    config = {"configurable":{"thread_id":123}}
+    # res = await agent.ainvoke({"messages":[time_system_prompt,{"role":"user","content":user_query}]},config=config)
+
+    # 3、如何去调用agent: 通过流式输出
+    async for chunk in agent.astream({"messages":[time_system_prompt,{"role":"user","content":user_query}]},config=config,stream_mode="messages"):
+        # chunk首先一个tuple:(AIMessageChunk/ToolMessage,_)
+        message = chunk[0]
+        if type(message) == ToolMessage:
+            continue
+        # 这个message 需要通过什么方式，给到谁：需要通过接口的方式，给到前端，然后让前端去展示？
+        # SSE: Server-Sent Events 
+        # SSE的数据结构：data: {"type":"token","content":"你好"}\n\n
+
+        # 快速地将这个方法产出的token，给到后端接口，让后端接口去输出给前端
+        import json
+        payload = {"content":message.content,"type":"token"}
+        payload_str = json.dumps(payload,ensure_ascii=False)
+        yield f'data: {payload_str}\n\n'
 
 
     
@@ -181,22 +213,47 @@ VALUES
 
 
 async def create_agent():
-    from pathlib import Path
-    from langchain.agents import create_agent
-    from langchain_openai import ChatOpenAI
-    
-    llm = ChatOpenAI()
-    with open(str(root_path / 'agent' /"prompts" / 'system_prompt.txt')) as f:
-        system_prompt = f.read()
+    global agent 
+    if agent is None:
+        from pathlib import Path
+        from langchain.agents import create_agent
+        from langchain_openai import ChatOpenAI
+        from langchain_mcp_adapters.client import MultiServerMCPClient
+        from langgraph.checkpoint.memory import InMemorySaver
 
-    agent = create_agent(
-        model=llm,
-        system_prompt=system_prompt,
-        tools=[]
-    )
 
+        checkpointer = InMemorySaver()
+
+        client  = MultiServerMCPClient(
+            connections={
+                "amap_map":{
+            "transport": "sse",
+            "url": "https://mcp.api-inference.modelscope.net/ccaef2a2308042/sse"
+            }
+
+            }
+        )
+        
+        llm = ChatOpenAI()
+        with open(str(root_path / 'agent' /"prompts" / 'system_prompt.txt'),encoding="utf-8",mode="r") as f:
+            system_prompt = f.read()
+        mcp_tools = await client.get_tools()
+        agent = create_agent(
+            model=llm,
+            system_prompt=system_prompt,
+            tools=[search_main_dishes,user_flavor_search,make_reservation]+mcp_tools,
+            checkpointer=checkpointer
+        )
+    return agent
+
+async def test_agent():
+    agent = await create_agent()
+    config = {"configurable":{"thread_id":"123"}}
+    res = await agent.ainvoke({"messages":[{"role":"user","content":"你能为我做什么？"}]},config=config)
+
+    print(res["messages"][-1].content)
 
 if __name__ == '__main__':
-    # num_people:int,num_children:int,arrival_time:str,seat_preference:str,main_dish_preference:str,comment:str
-    res= make_reservation.invoke({"num_people":2,"num_children":1,"arrival_time":"2024-01-01 18","seat_preference":"","main_dish_preference":"","comment":""})
-    print(res)
+    import asyncio
+    asyncio.run(test_agent())
+    
